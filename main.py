@@ -1,15 +1,15 @@
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Depends
+from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from azure.storage.blob import BlobServiceClient
-from pydantic import BaseModel
-import uuid
 import requests
+import uuid
 import os
-import time
+import openai
+from dotenv import load_dotenv
+
+load_dotenv()
 
 app = FastAPI()
 
-# Allow front-end to access backend (adjust for production later)
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -18,63 +18,87 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# Azure settings (set your own in environment variables)
 AZURE_SPEECH_KEY = os.getenv("AZURE_SPEECH_KEY")
 AZURE_SPEECH_REGION = os.getenv("AZURE_SPEECH_REGION")
-AZURE_BLOB_CONNECTION_STRING = os.getenv("AZURE_BLOB_CONNECTION_STRING")
-AZURE_BLOB_CONTAINER = "audiofiles"
+AZURE_STORAGE_BASE_URL = os.getenv("AZURE_STORAGE_BASE_URL")
+AZURE_BLOB_SAS_TOKEN = os.getenv("AZURE_BLOB_SAS_TOKEN")
+AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
+AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
+AZURE_DEPLOYMENT_NAME = "gpt-35-turbo"
 
-blob_service = BlobServiceClient.from_connection_string(AZURE_BLOB_CONNECTION_STRING)
-container_client = blob_service.get_container_client(AZURE_BLOB_CONTAINER)
+openai.api_type = "azure"
+openai.api_base = AZURE_OPENAI_ENDPOINT
+openai.api_version = "2023-12-01-preview"
+openai.api_key = AZURE_OPENAI_KEY
 
-class TranscriptionResponse(BaseModel):
-    transcript: str
-
-@app.post("/upload", response_model=TranscriptionResponse)
+@app.post("/upload")
 async def upload_audio(file: UploadFile = File(...)):
-    # Step 1: Save to Azure Blob
-    file_id = str(uuid.uuid4())
-    blob_name = f"{file_id}_{file.filename}"
-    blob_client = container_client.get_blob_client(blob_name)
-    blob_data = await file.read()
-    blob_client.upload_blob(blob_data, overwrite=True)
+    # Save file locally
+    filename = f"{uuid.uuid4()}_{file.filename}"
+    filepath = f"/tmp/{filename}"
+    with open(filepath, "wb") as buffer:
+        buffer.write(await file.read())
 
-    blob_url = f"https://{blob_service.account_name}.blob.core.windows.net/{AZURE_BLOB_CONTAINER}/{blob_name}"
+    # Upload to Azure Blob Storage
+    blob_url = f"{AZURE_STORAGE_BASE_URL}/{filename}{AZURE_BLOB_SAS_TOKEN}"
+    with open(filepath, "rb") as data:
+        requests.put(blob_url, data=data, headers={"x-ms-blob-type": "BlockBlob"})
 
-    # Step 2: Send to Azure Speech-to-Text
+    # Submit transcription job
+    transcription_id = str(uuid.uuid4())
+    transcription_payload = {
+        "contentUrls": [blob_url.split('?')[0]],
+        "locale": "en-US",
+        "displayName": "Chiro Upload"
+    }
     transcription_url = f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/speechtotext/v3.0/transcriptions"
     headers = {
         "Ocp-Apim-Subscription-Key": AZURE_SPEECH_KEY,
         "Content-Type": "application/json"
     }
-    payload = {
-        "contentUrls": [blob_url],
-        "locale": "en-US",
-        "displayName": f"Chiro Voice - {file.filename}"
+    response = requests.post(transcription_url, headers=headers, json=transcription_payload)
+    transcription_location = response.headers["Location"]
+
+    # Poll for completion
+    import time
+    while True:
+        r = requests.get(transcription_location, headers=headers)
+        status = r.json()["status"]
+        if status in ["Succeeded", "Failed"]:
+            break
+        time.sleep(5)
+
+    if status == "Failed":
+        return {"error": "Transcription failed."}
+
+    # Get transcript file
+    files_url = r.json()["links"]["files"]
+    files_list = requests.get(files_url, headers=headers).json()
+    transcript_file_url = next(f["links"]["contentUrl"] for f in files_list["values"] if f["kind"] == "Transcription")
+    transcript_text = requests.get(transcript_file_url).text
+
+    # Generate AI outputs using Azure OpenAI
+    def prompt_gpt(prompt):
+        completion = openai.ChatCompletion.create(
+            engine=AZURE_DEPLOYMENT_NAME,
+            messages=[
+                {"role": "system", "content": "You are a medical assistant that helps chiropractors summarize patient visits."},
+                {"role": "user", "content": prompt}
+            ]
+        )
+        return completion.choices[0].message.content.strip()
+
+    soap_prompt = f"Generate a SOAP note from this transcript:\n{transcript_text}"
+    referral_prompt = f"Write a professional referral letter from this patient visit transcript:\n{transcript_text}"
+    codes_prompt = f"Suggest appropriate CPT and ICD-10 codes based on this conversation:\n{transcript_text}"
+
+    soap_note = prompt_gpt(soap_prompt)
+    referral_letter = prompt_gpt(referral_prompt)
+    codes = prompt_gpt(codes_prompt)
+
+    return {
+        "transcript": transcript_text,
+        "soap_note": soap_note,
+        "referral_letter": referral_letter,
+        "codes": codes
     }
-    response = requests.post(transcription_url, json=payload, headers=headers)
-    if response.status_code != 201:
-        raise HTTPException(status_code=500, detail="Failed to start transcription.")
-
-    transcription_status_url = response.json()["self"]
-
-    # Step 3: Poll until transcription is done
-    for _ in range(30):
-        time.sleep(10)
-        status_response = requests.get(transcription_status_url, headers=headers)
-        status_data = status_response.json()
-        if status_data.get("status") == "Succeeded":
-            files_url = status_data["links"]["files"]
-            files_response = requests.get(files_url, headers=headers)
-            files = files_response.json()["values"]
-            transcription_file = next((f for f in files if f["kind"] == "Transcription"), None)
-            if transcription_file:
-                content_url = transcription_file["links"]["contentUrl"]
-                content_response = requests.get(content_url, headers=headers)
-                phrases = content_response.json().get("combinedRecognizedPhrases", [])
-                transcript = phrases[0].get("display", "") if phrases else ""
-                return {"transcript": transcript}
-        elif status_data.get("status") == "Failed":
-            raise HTTPException(status_code=500, detail="Transcription failed.")
-
-    raise HTTPException(status_code=504, detail="Transcription timed out.")
