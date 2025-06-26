@@ -37,21 +37,23 @@ openai.api_key = AZURE_OPENAI_KEY
 @app.post("/upload")
 async def upload_audio(file: UploadFile = File(...)):
     try:
-        # Save file locally
+        print("Step 1: File received.")
         filename = f"{uuid.uuid4()}_{file.filename}"
         local_path = f"/tmp/{filename}"
         with open(local_path, "wb") as f:
             f.write(await file.read())
+        print(f"Step 2: File saved locally at {local_path}")
 
-        # Upload to Azure Blob
+        # Upload to Azure Blob Storage
         blob_url = f"{AZURE_STORAGE_BASE_URL}/{filename}?{AZURE_BLOB_SAS_TOKEN}"
         with open(local_path, "rb") as data:
-            upload_headers = {"x-ms-blob-type": "BlockBlob"}
-            blob_response = requests.put(blob_url, headers=upload_headers, data=data)
-            if blob_response.status_code not in [201, 200]:
-                return {"error": f"Blob upload failed: {blob_response.text}"}
+            blob_response = requests.put(blob_url, headers={"x-ms-blob-type": "BlockBlob"}, data=data)
+        print(f"Step 3: Blob upload status: {blob_response.status_code}")
 
-        # Submit Transcription Job
+        if blob_response.status_code not in [200, 201]:
+            return {"error": f"Blob upload failed: {blob_response.text}"}
+
+        # Start Azure Speech Transcription Job
         transcription_payload = {
             "contentUrls": [blob_url.split("?")[0]],
             "locale": "en-US",
@@ -63,48 +65,64 @@ async def upload_audio(file: UploadFile = File(...)):
             "Content-Type": "application/json"
         }
         create_response = requests.post(transcription_url, json=transcription_payload, headers=headers)
+        print(f"Step 4: Transcription job submission status: {create_response.status_code}")
+
         if create_response.status_code != 202:
             return {"error": f"Transcription job creation failed: {create_response.text}"}
 
-        # Poll for Transcription Completion
         transcription_location = create_response.headers["Location"]
+        print(f"Step 5: Transcription Location URL: {transcription_location}")
+
+        # Poll transcription job status with a timeout
+        max_wait_time = 120  # 2 minutes
+        start_time = time.time()
+
         while True:
-            status_check = requests.get(transcription_location, headers=headers).json()
-            status = status_check.get("status")
-            if status in ["Succeeded", "Failed"]:
+            poll_response = requests.get(transcription_location, headers=headers)
+            status = poll_response.json().get("status")
+            print(f"Polling status: {status}")
+
+            if status == "Succeeded":
                 break
+            if status == "Failed":
+                return {"error": "Azure transcription job failed"}
+
+            if time.time() - start_time > max_wait_time:
+                return {"error": "Azure transcription timed out after 2 minutes"}
+
             time.sleep(5)
 
-        if status == "Failed":
-            return {"error": "Azure transcription job failed"}
-
-        # Get Transcript File Link
-        files_url = status_check["links"]["files"]
+        # Fetch transcript file URL
+        files_url = poll_response.json()["links"]["files"]
         files_list = requests.get(files_url, headers=headers).json()
         transcript_file_url = next(
-            (file["links"]["contentUrl"] for file in files_list["values"] if file["kind"] == "Transcription"),
+            (f["links"]["contentUrl"] for f in files_list["values"] if f["kind"] == "Transcription"),
             None
         )
 
         if not transcript_file_url:
-            return {"error": "Transcript file not found"}
+            return {"error": "No transcript file found"}
 
         transcript_text = requests.get(transcript_file_url).text
+        print("Step 6: Transcript text downloaded.")
 
-        # Send transcript to Azure OpenAI (GPT)
+        # Generate AI Outputs with GPT
         def ask_gpt(prompt):
+            print(f"Sending GPT prompt: {prompt[:50]}...")
             chat_response = openai.ChatCompletion.create(
                 engine=AZURE_DEPLOYMENT_NAME,
                 messages=[
-                    {"role": "system", "content": "You are a medical assistant that helps chiropractors summarize patient visits."},
+                    {"role": "system", "content": "You are a medical assistant helping chiropractors generate SOAP notes, referral letters, and billing codes."},
                     {"role": "user", "content": prompt}
                 ]
             )
             return chat_response.choices[0].message.content.strip()
 
-        soap_note = ask_gpt(f"Generate a SOAP note for the following transcript:\n{transcript_text}")
-        referral_letter = ask_gpt(f"Write a referral letter based on this transcript:\n{transcript_text}")
-        codes = ask_gpt(f"Suggest ICD-10 and CPT codes for this transcript:\n{transcript_text}")
+        soap_note = ask_gpt(f"Generate a SOAP note for this transcript:\n{transcript_text}")
+        referral_letter = ask_gpt(f"Write a professional referral letter for this patient visit:\n{transcript_text}")
+        codes = ask_gpt(f"Suggest CPT and ICD-10 codes for this transcript:\n{transcript_text}")
+
+        print("Step 7: AI outputs generated successfully.")
 
         return {
             "transcript": transcript_text,
@@ -114,7 +132,10 @@ async def upload_audio(file: UploadFile = File(...)):
         }
 
     except Exception as e:
+        print(f"Server error: {str(e)}")
         return {"error": str(e)}
+
+# Basic health check route to prevent shutdown
 @app.get("/")
 def health_check():
     return {"status": "Backend running"}
