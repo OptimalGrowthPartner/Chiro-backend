@@ -115,3 +115,6 @@ async def upload_audio(file: UploadFile = File(...)):
 
     except Exception as e:
         return {"error": str(e)}
+@app.get("/")
+def health_check():
+    return {"status": "Backend running"}
