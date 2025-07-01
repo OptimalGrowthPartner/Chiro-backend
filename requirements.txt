@@ -1,7 +1,9 @@
-fastapi
-uvicorn
-python-multipart
-azure-storage-blob
-requests
-python-dotenv
-openai
+fastapi==0.104.1
+uvicorn[standard]==0.24.0
+python-multipart==0.0.6
+aiohttp==3.9.1
+aiofiles==23.2.1
+azure-storage-blob==12.19.0
+openai==0.28.1
+pydantic==2.5.1
+python-dotenv==1.0.0
