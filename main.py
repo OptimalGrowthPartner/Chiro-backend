@@ -11,8 +11,13 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from azure.storage.blob.aio import BlobServiceClient
 from azure.storage.blob import generate_blob_sas, BlobSasPermissions
-import openai
+from openai import AsyncAzureOpenAI
 from pydantic import BaseModel
+import logging
+
+# Set up logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 # Initialize FastAPI app
 app = FastAPI(title="HIPAA Compliant Chiropractic AI Assistant")
@@ -35,11 +40,26 @@ AZURE_OPENAI_ENDPOINT = os.getenv("AZURE_OPENAI_ENDPOINT")
 AZURE_OPENAI_KEY = os.getenv("AZURE_OPENAI_KEY")
 AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT", "gpt-35-turbo")
 
-# Configure Azure OpenAI
-openai.api_type = "azure"
-openai.api_base = AZURE_OPENAI_ENDPOINT
-openai.api_version = "2023-12-01-preview"
-openai.api_key = AZURE_OPENAI_KEY
+# Validate required environment variables
+required_env_vars = [
+    "AZURE_STORAGE_CONNECTION_STRING",
+    "AZURE_SPEECH_KEY", 
+    "AZURE_SPEECH_REGION",
+    "AZURE_OPENAI_ENDPOINT",
+    "AZURE_OPENAI_KEY"
+]
+
+for var in required_env_vars:
+    if not os.getenv(var):
+        logger.error(f"Missing required environment variable: {var}")
+        raise ValueError(f"Missing required environment variable: {var}")
+
+# Configure Azure OpenAI client
+openai_client = AsyncAzureOpenAI(
+    api_key=AZURE_OPENAI_KEY,
+    api_version="2023-12-01-preview",
+    azure_endpoint=AZURE_OPENAI_ENDPOINT
+)
 
 class TranscriptionResponse(BaseModel):
     transcript: str
@@ -58,6 +78,8 @@ async def upload_and_process(file: UploadFile = File(...)):
     Upload audio file, transcribe, and generate clinical documents
     """
     try:
+        logger.info(f"Processing file: {file.filename}")
+        
         # Validate file type
         if not file.filename.lower().endswith(('.wav', '.mp3', '.m4a', '.flac')):
             raise HTTPException(status_code=400, detail="Invalid file type. Please upload audio files only.")
@@ -66,11 +88,17 @@ async def upload_and_process(file: UploadFile = File(...)):
         file_id = str(uuid.uuid4())
         blob_name = f"{file_id}_{file.filename}"
         
+        logger.info(f"Uploading to Azure Blob: {blob_name}")
+        
         # Upload to Azure Blob Storage
         blob_url = await upload_to_azure_blob(file, blob_name)
         
+        logger.info("Starting transcription")
+        
         # Start transcription
         transcript = await transcribe_audio(blob_url)
+        
+        logger.info("Generating clinical documents")
         
         # Generate clinical documents using Azure OpenAI
         soap_note = await generate_soap_note(transcript)
@@ -80,6 +108,8 @@ async def upload_and_process(file: UploadFile = File(...)):
         # Clean up blob (optional - you may want to keep for audit trail)
         # await delete_azure_blob(blob_name)
         
+        logger.info("Processing completed successfully")
+        
         return TranscriptionResponse(
             transcript=transcript,
             soap_note=soap_note,
@@ -87,7 +117,10 @@ async def upload_and_process(file: UploadFile = File(...)):
             codes=codes
         )
         
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Processing failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Processing failed: {str(e)}")
 
 async def upload_to_azure_blob(file: UploadFile, blob_name: str) -> str:
@@ -99,8 +132,11 @@ async def upload_to_azure_blob(file: UploadFile, blob_name: str) -> str:
             blob=blob_name
         )
         
+        # Read file content
+        file_content = await file.read()
+        
         # Upload file
-        await blob_client.upload_blob(await file.read(), overwrite=True)
+        await blob_client.upload_blob(file_content, overwrite=True)
         
         # Generate SAS token for secure access
         sas_token = generate_blob_sas(
@@ -113,9 +149,11 @@ async def upload_to_azure_blob(file: UploadFile, blob_name: str) -> str:
         )
         
         blob_url = f"{blob_client.url}?{sas_token}"
+        logger.info(f"Blob uploaded successfully: {blob_url}")
         return blob_url
         
     except Exception as e:
+        logger.error(f"Blob upload failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Blob upload failed: {str(e)}")
 
 async def transcribe_audio(blob_url: str) -> str:
@@ -139,7 +177,9 @@ async def transcribe_audio(blob_url: str) -> str:
             'displayName': 'Chiropractic Consultation Transcription'
         }
         
-        async with aiohttp.ClientSession() as session:
+        timeout = aiohttp.ClientTimeout(total=300)  # 5 minute timeout
+        
+        async with aiohttp.ClientSession(timeout=timeout) as session:
             # Submit transcription job
             async with session.post(
                 f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/speechtotext/v3.1/transcriptions",
@@ -147,20 +187,27 @@ async def transcribe_audio(blob_url: str) -> str:
                 json=transcription_request
             ) as response:
                 if response.status != 201:
-                    raise HTTPException(status_code=500, detail="Failed to start transcription")
+                    error_text = await response.text()
+                    logger.error(f"Failed to start transcription: {response.status} - {error_text}")
+                    raise HTTPException(status_code=500, detail=f"Failed to start transcription: {error_text}")
                 
                 transcription_response = await response.json()
                 transcription_id = transcription_response['self'].split('/')[-1]
+                logger.info(f"Transcription started with ID: {transcription_id}")
             
             # Poll for completion
-            for _ in range(60):  # 5-minute timeout
+            for attempt in range(60):  # 5-minute timeout
                 await asyncio.sleep(5)
                 
                 async with session.get(
                     f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/speechtotext/v3.1/transcriptions/{transcription_id}",
                     headers=headers
                 ) as response:
+                    if response.status != 200:
+                        continue
+                        
                     status_response = await response.json()
+                    logger.info(f"Transcription status: {status_response['status']}")
                     
                     if status_response['status'] == 'Succeeded':
                         # Get transcription files
@@ -168,12 +215,18 @@ async def transcribe_audio(blob_url: str) -> str:
                             f"https://{AZURE_SPEECH_REGION}.api.cognitive.microsoft.com/speechtotext/v3.1/transcriptions/{transcription_id}/files",
                             headers=headers
                         ) as files_response:
+                            if files_response.status != 200:
+                                continue
+                                
                             files_data = await files_response.json()
                             
                             # Find the transcription result file
                             for file_info in files_data['values']:
                                 if file_info['kind'] == 'Transcription':
                                     async with session.get(file_info['links']['contentUrl']) as content_response:
+                                        if content_response.status != 200:
+                                            continue
+                                            
                                         transcription_result = await content_response.json()
                                         
                                         # Extract combined text
@@ -181,14 +234,22 @@ async def transcribe_audio(blob_url: str) -> str:
                                         for phrase in transcription_result.get('combinedRecognizedPhrases', []):
                                             combined_text += phrase.get('display', '') + " "
                                         
-                                        return combined_text.strip()
+                                        result = combined_text.strip()
+                                        logger.info(f"Transcription completed: {len(result)} characters")
+                                        return result or "No transcription available"
                     
                     elif status_response['status'] == 'Failed':
-                        raise HTTPException(status_code=500, detail="Transcription failed")
+                        error_msg = status_response.get('error', {}).get('message', 'Unknown error')
+                        logger.error(f"Transcription failed: {error_msg}")
+                        raise HTTPException(status_code=500, detail=f"Transcription failed: {error_msg}")
             
+            logger.error("Transcription timeout")
             raise HTTPException(status_code=408, detail="Transcription timeout")
             
+    except HTTPException:
+        raise
     except Exception as e:
+        logger.error(f"Transcription failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Transcription failed: {str(e)}")
 
 async def generate_soap_note(transcript: str) -> str:
@@ -216,8 +277,8 @@ async def generate_soap_note(transcript: str) -> str:
     """
     
     try:
-        response = await openai.ChatCompletion.acreate(
-            engine=AZURE_OPENAI_DEPLOYMENT,
+        response = await openai_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
             messages=[
                 {"role": "system", "content": "You are a professional chiropractic documentation assistant. Create accurate, concise SOAP notes based on consultation transcripts."},
                 {"role": "user", "content": prompt}
@@ -229,6 +290,7 @@ async def generate_soap_note(transcript: str) -> str:
         return response.choices[0].message.content.strip()
         
     except Exception as e:
+        logger.error(f"SOAP note generation failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"SOAP note generation failed: {str(e)}")
 
 async def generate_referral_letter(transcript: str) -> str:
@@ -252,8 +314,8 @@ async def generate_referral_letter(transcript: str) -> str:
     """
     
     try:
-        response = await openai.ChatCompletion.acreate(
-            engine=AZURE_OPENAI_DEPLOYMENT,
+        response = await openai_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
             messages=[
                 {"role": "system", "content": "You are a chiropractic clinical decision support assistant. Generate appropriate referral letters only when clinically indicated."},
                 {"role": "user", "content": prompt}
@@ -265,6 +327,7 @@ async def generate_referral_letter(transcript: str) -> str:
         return response.choices[0].message.content.strip()
         
     except Exception as e:
+        logger.error(f"Referral letter generation failed: {str(e)}", exc_info=True)
         raise HTTPException(status_code=500, detail=f"Referral letter generation failed: {str(e)}")
 
 async def generate_billing_codes(transcript: str) -> dict:
@@ -290,8 +353,8 @@ async def generate_billing_codes(transcript: str) -> dict:
     """
     
     try:
-        response = await openai.ChatCompletion.acreate(
-            engine=AZURE_OPENAI_DEPLOYMENT,
+        response = await openai_client.chat.completions.create(
+            model=AZURE_OPENAI_DEPLOYMENT,
             messages=[
                 {"role": "system", "content": "You are a medical coding assistant specialized in chiropractic billing. Provide accurate CPT and ICD-10 code suggestions in JSON format."},
                 {"role": "user", "content": prompt}
@@ -309,6 +372,7 @@ async def generate_billing_codes(transcript: str) -> dict:
         return json.loads(codes_text)
         
     except Exception as e:
+        logger.error(f"Code generation failed: {str(e)}", exc_info=True)
         # Return fallback structure if parsing fails
         return {
             "cpt_codes": [{"code": "Error", "description": f"Code generation failed: {str(e)}"}],
@@ -324,8 +388,8 @@ async def delete_azure_blob(blob_name: str):
             blob=blob_name
         )
         await blob_client.delete_blob()
-    except:
-        pass  # Ignore cleanup errors
+    except Exception as e:
+        logger.warning(f"Failed to delete blob {blob_name}: {str(e)}")
 
 if __name__ == "__main__":
     import uvicorn
